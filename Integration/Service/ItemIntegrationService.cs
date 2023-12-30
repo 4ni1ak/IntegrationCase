@@ -1,32 +1,77 @@
-﻿using Integration.Common;
-using Integration.Backend;
+﻿using Integration.Backend;
+using Integration.Common;
+using Microsoft.Extensions.Caching.Memory;
 
-namespace Integration.Service;
-
-public sealed class ItemIntegrationService
+namespace Integration.Service
 {
-    //This is a dependency that is normally fulfilled externally.
-    private ItemOperationBackend ItemIntegrationBackend { get; set; } = new();
-
-    // This is called externally and can be called multithreaded, in parallel.
-    // More than one item with the same content should not be saved. However,
-    // calling this with different contents at the same time is OK, and should
-    // be allowed for performance reasons.
-    public Result SaveItem(string itemContent)
+    // The class within the Integration.Service namespace
+    public sealed class ItemIntegrationService
     {
-        // Check the backend to see if the content is already saved.
-        if (ItemIntegrationBackend.FindItemsWithContent(itemContent).Count != 0)
+        private readonly IMemoryCache _memoryCache;  // Interface reference for memory caching
+        private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();  // ReaderWriterLockSlim object for read/write locking
+        private readonly ItemOperationBackend _itemIntegrationBackend = new ItemOperationBackend();  // Reference for backend operations
+
+        // Constructor configured with IMemoryCache
+        public ItemIntegrationService(IMemoryCache memoryCache)
         {
-            return new Result(false, $"Duplicate item received with content {itemContent}.");
+            _memoryCache = memoryCache ?? throw new ArgumentNullException(nameof(memoryCache));
         }
 
-        var item = ItemIntegrationBackend.SaveItem(itemContent);
+        // Represents the method to save an item coming from the external world
+        public Result SaveItem(string itemContent)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                // Attempt to add the item atomically
+                if (_memoryCache.TryGetValue(itemContent, out _))
+                {
+                    return new Result(false, $"Duplicate item received with content {itemContent}.");
+                }
 
-        return new Result(true, $"Item with content {itemContent} saved with id {item.Id}");
-    }
+                // Create a new item using ItemOperationBackend
+                var item = _itemIntegrationBackend.SaveItem(itemContent);
 
-    public List<Item> GetAllItems()
-    {
-        return ItemIntegrationBackend.GetAllItems();
+                // Attempt to add the item atomically
+                if (_memoryCache.TryGetValue(itemContent, out _))
+                {
+                    // Another thread may have added this item.
+                    return new Result(false, $"Duplicate item received with content {itemContent}.");
+                }
+
+                // Attempt to add the item atomically using the Add method
+                var cacheEntryOptions = new MemoryCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(1) // Example: 1 minute
+                };
+
+                if (_memoryCache.TryGetValue(itemContent, out _))
+                {
+                    // Another thread may have added this item.
+                    return new Result(false, $"Duplicate item received with content {itemContent}.");
+                }
+                _memoryCache.Set(itemContent, item, cacheEntryOptions);
+
+                return new Result(true, $"Item with content {itemContent} saved with id {item.Id}");
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
+        }
+
+        // Represents a method to get all items
+        public List<Item> GetAllItems()
+        {
+            _lock.EnterReadLock();  // Acquire the lock before starting the read operation
+            try
+            {
+                return _itemIntegrationBackend.GetAllItems();
+            }
+            finally
+            {
+                _lock.ExitReadLock();  // Release the lock after completing the read operation
+            }
+        }
     }
 }
